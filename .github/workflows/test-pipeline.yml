@@ -126,20 +126,29 @@ jobs:
           export MLFLOW_TRACKING_URI="file:./mlruns"
           python src/train.py
 
-      - name: Start Uvicorn server (background) and wait for readiness
+      - name: Start Uvicorn server (background) and wait for /health
         run: |
-          nohup uvicorn src.serve:app --host 0.0.0.0 --port 8080 &> /tmp/uvicorn.log &
+          nohup uvicorn src.serve:app --host 0.0.0.0 --port 8080 --log-level info &> /tmp/uvicorn.log &
+          # wait up to 30s for health check to return 200
           i=0
-          until curl -sSf http://localhost:8080/ || [ $i -ge 30 ]; do
+          until curl -sSf -o /dev/null http://localhost:8080/health || [ $i -ge 30 ]; do
             i=$((i+1))
-            echo "waiting for server... $i"
+            echo "waiting for /health... $i"
             sleep 1
           done
-          echo "--- server log tail ---"
-          tail -n 50 /tmp/uvicorn.log || true
+          echo "------ server log (tail 200) ------"
+          tail -n 200 /tmp/uvicorn.log || true
 
       - name: Run API integration tests
-        run: pytest tests/test_api_integration.py -q
+        run: |
+          pytest tests/test_api_integration.py -q
+
+      - name: Upload integration junit (if created)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-junit
+          path: reports/junit/integration-junit.xml
 
   build-and-push:
     runs-on: ubuntu-latest
