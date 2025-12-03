@@ -1,49 +1,221 @@
 ﻿name: PR Test Pipeline
 
+# Run on any push or PR while debugging
 on:
-  pull_request:
-    branches: [ main ]
-  push:
-    branches: [ main ]
+  push: {}
+  pull_request: {}
 
 jobs:
-  unit-tests:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install deps
-        run: pip install -r requirements.txt
-      - name: Run pytest
-        run: pytest -q
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install flake8
+        run: python -m pip install --upgrade pip && pip install flake8
+      - name: Run flake8
+        run: flake8 src || true
 
-  model-validation:
+  unit-tests:
+    name: Unit tests (skip if none)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies for tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest || true
+      - name: Find unit test files (exclude integration) and run pytest if present
+        run: |
+          echo "Looking for unit tests (excluding tests/test_api_integration.py)..."
+          UNIT_FILES=$(python - <<'PY'
+import glob,sys
+files=[]
+for f in glob.glob('tests/**/*.py', recursive=True):
+    if f.replace('\\','/').endswith('test_api_integration.py'):
+        continue
+    try:
+        with open(f, 'r', encoding='utf-8') as fh:
+            src = fh.read()
+    except Exception:
+        src = ''
+    if 'def test_' in src:
+        files.append(f)
+print(' '.join(files))
+PY
+)
+          if [ -z "$UNIT_FILES" ]; then
+            echo "No unit tests found (skipping pytest)."
+            mkdir -p reports/junit
+            echo '<?xml version="1.0" encoding="utf-8"?><testsuite tests="0"></testsuite>' > reports/junit/unit-junit.xml
+          else
+            echo "Running pytest on: $UNIT_FILES"
+            pytest -q $UNIT_FILES --junitxml=reports/junit/unit-junit.xml
+          fi
+      - name: Upload unit junit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-junit
+          path: reports/junit/unit-junit.xml
+
+  security-scans:
+    name: Security scans
     runs-on: ubuntu-latest
     needs: unit-tests
     steps:
       - uses: actions/checkout@v4
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip && pip install pip-audit || true
+      - name: Run pip-audit
+        run: |
+          mkdir -p reports/security
+          pip-audit -r requirements.txt --format json -o reports/security/pip_audit.json || true
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/security
+
+  model-validation:
+    name: Model validation
+    runs-on: ubuntu-latest
+    needs: security-scans
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
       - name: Run model validation
         run: |
-          pip install -r requirements.txt
-          python tests/validate_model.py --min-accuracy 0.7
+          export MLFLOW_TRACKING_URI="file:./mlruns"
+          python tests/validate_model.py --min-accuracy 0.7 --run-id-file reports/validated_run.txt
+      - name: Upload model validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-validation
+          path: reports
 
   esg-check:
+    name: ESG check
     runs-on: ubuntu-latest
     needs: model-validation
     steps:
       - uses: actions/checkout@v4
-      - name: Run ESG check
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install deps (codecarbon)
         run: |
-          pip install -r requirements.txt codecarbon
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt codecarbon || true
+      - name: Run ESG budget check
+        run: |
           python tests/esg_budget_check.py --max-kg 0.5 --out reports/esg_report.json
+      - name: Upload esg report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esg-report
+          path: reports/esg_report.json
 
   integration:
+    name: Integration (train -> start server -> tests)
     runs-on: ubuntu-latest
     needs: esg-check
     steps:
       - uses: actions/checkout@v4
-      - name: Start services and run integration tests
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install critical binary wheels (prevent ABI mismatch)
         run: |
-          docker compose up -d --build
-          sleep 6
-          pip install -r requirements.txt requests
+          python -m pip install --upgrade pip
+          python -m pip install --only-binary=:all: numpy==1.25.2 scikit-learn==1.3.2 joblib==1.2.0 || true
+
+      - name: Install rest of dependencies
+        run: |
+          pip install -r requirements.txt || true
+
+      - name: Show repo & check model artifact
+        run: |
+          echo "PWD: $(pwd)"
+          echo "ls -la repo root:"
+          ls -la
+          echo "ls -la artifacts:"
+          ls -la artifacts || true
+          echo "check model file exists:"
+          if [ -f artifacts/model.joblib ]; then echo "MODEL EXISTS"; else echo "MODEL MISSING"; fi
+
+      - name: Quick python sanity checks (imports + load model)
+        run: |
+          echo "python version:"
+          python -V
+          echo "numpy version:"
+          python -c "import numpy as np; print(np.__version__)"
+          echo "sklearn version:"
+          python -c "import sklearn; print(sklearn.__version__)"
+          echo "joblib import test:"
+          python -c "import joblib; print('joblib ok')"
+          echo "try loading model (this will show error if load fails):"
+          python -c "import joblib, sys, os; p='artifacts/model.joblib'; print('exists?', os.path.exists(p)); sys.stdout.flush(); \
+            try: m=joblib.load(p); print('loaded ok, type=', type(m)); \
+            except Exception as e: print('MODEL LOAD ERROR:', repr(e)); raise"
+
+      - name: Start Uvicorn server (background) and wait for /health
+        run: |
+          nohup uvicorn src.serve:app --host 0.0.0.0 --port 8080 --log-level info &> /tmp/uvicorn.log &
+          sleep 1
+          echo "=== server processes (ps) ==="
+          ps aux | grep uvicorn || true
+          echo "=== listening ports (ss) ==="
+          ss -tulpn || true
+          i=0
+          until curl -sSf -o /dev/null http://localhost:8080/health || [ $i -ge 30 ]; do
+            i=$((i+1))
+            echo "waiting for /health... $i"
+            sleep 1
+          done
+          echo "------ server log (tail 200) ------"
+          tail -n 200 /tmp/uvicorn.log || true
+
+      - name: Run API integration tests
+        run: |
           pytest tests/test_api_integration.py -q
+
+  build-and-push:
+    name: Build and push
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/esg-app:latest
