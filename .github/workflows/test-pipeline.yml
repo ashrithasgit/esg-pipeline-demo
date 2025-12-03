@@ -1,0 +1,49 @@
+﻿name: PR Test Pipeline
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run pytest
+        run: pytest -q
+
+  model-validation:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run model validation
+        run: |
+          pip install -r requirements.txt
+          python tests/validate_model.py --min-accuracy 0.7
+
+  esg-check:
+    runs-on: ubuntu-latest
+    needs: model-validation
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ESG check
+        run: |
+          pip install -r requirements.txt codecarbon
+          python tests/esg_budget_check.py --max-kg 0.5 --out reports/esg_report.json
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: esg-check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start services and run integration tests
+        run: |
+          docker compose up -d --build
+          sleep 6
+          pip install -r requirements.txt requests
+          pytest tests/test_api_integration.py -q
